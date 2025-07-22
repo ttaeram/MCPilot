@@ -1,25 +1,13 @@
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-import json
-import httpx
-import os
-from dotenv import load_dotenv
-from app.review_graph import graph
+from app.services.review_service import review_diff_concurrently, fetch_pr_files
 from app.slack_alert import send_slack_alert
+import os, json, httpx
 
-load_dotenv()
+router = APIRouter()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-app = FastAPI()
-
-async def fetch_pr_files(files_url: str):
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
-    async with httpx.AsyncClient() as client:
-        response = await client.get(files_url, headers=headers)
-        response.raise_for_status()
-        return response.json()
-
-@app.post("/webhook")
+@router.post("")
 async def github_webhook(request: Request):
     headers = request.headers
     body = await request.body()
@@ -38,11 +26,9 @@ async def github_webhook(request: Request):
         pr_url = pr.get("html_url")
 
         print(f"[Webhook] Pull request {action} on repo {repo.get('full_name')}")
-
         if action == "opened":
             send_slack_alert("pr_created", pr_url)
 
-        # 파일 목록과 diff 불러오기
         files = await fetch_pr_files(files_url)
         for f in files:
             print(f"\n📄 파일: {f['filename']}")
@@ -50,8 +36,8 @@ async def github_webhook(request: Request):
             if not diff_text:
                 continue
 
-            result = graph.invoke({"diff": diff_text})
-            final_review = result["final_review"]
+            state = await review_diff_concurrently(diff_text)
+            final_review = state["final_review"]
             print(f"\n📝 최종 리뷰 결과:\n{final_review}")
 
             send_slack_alert("mcpilot_review_posted", pr_url, review_text=final_review)
@@ -62,24 +48,19 @@ async def github_webhook(request: Request):
             }
 
             async with httpx.AsyncClient() as client:
-                comment_response = await client.post(
+                response = await client.post(
                     comment_url,
                     headers={"Authorization": f"Bearer {GITHUB_TOKEN}"},
                     json=comment_body
                 )
-                comment_response.raise_for_status()
-    
+                response.raise_for_status()
+
     elif event == "pull_request_review":
-        review = payload.get("review", {})
-        pr = payload.get("pull_request", {})
-        reviewer = review.get("user", {}).get("login")
-        review_text = review.get("body")
-        pr_url = pr.get("html_url")
+        reviewer = payload.get("review", {}).get("user", {}).get("login")
+        pr_url = payload.get("pull_request", {}).get("html_url")
+        review_text = payload.get("review", {}).get("body")
 
         print(f"[Webhook] 사용자 {reviewer}가 PR 리뷰를 작성했습니다.")
         send_slack_alert("user_review_posted", pr_url, reviewer=reviewer, review_text=review_text)
-
-    else:
-        print(f"[Webhook] Received non-PR event: {event}")
 
     return {"status": "ok"}
